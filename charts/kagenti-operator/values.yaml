@@ -187,7 +187,8 @@ featureGates:
 #   * authbridgeLite (lite mode):              authbridge-lite (jwt-validation + token-exchange only,
 #                                              parsers dropped) + spiffe-helper. Same listener layout
 #                                              as authbridge; for size-constrained deployments.
-# proxy-init applies to envoy-sidecar mode only.
+# proxy-init applies to envoy-sidecar mode (transparent redirect) and to
+# proxy-sidecar / lite mode (always-on enforce-redirect egress capture).
 defaults:
   images:
     envoyProxy: ghcr.io/kagenti/kagenti-extensions/authbridge-envoy:latest
@@ -202,6 +203,17 @@ defaults:
     uid: 1337
     adminPort: 9901
     inboundProxyPort: 15124
+    # Forward proxy's transparent listener port — the REDIRECT target for the
+    # always-on enforce-redirect egress guard (proxy-sidecar / lite). MUST match
+    # the authbridge listener.transparent_proxy_addr (default :8082).
+    transparentPort: 8082
+    # In-cluster CIDRs (pods/services/DNS) left direct by the enforce-redirect
+    # guard; external TCP is REDIRECTed to the transparent listener and external
+    # non-TCP is dropped. The default is Kind-shaped (pods 10.244/16 + services
+    # 10.96/16). OpenShift/EKS MUST override — e.g. OCP services 172.30.0.0/16
+    # (outside 10/8) + pods 10.128.0.0/14 — or in-cluster service traffic breaks.
+    clusterCIDRs:
+      - "10.0.0.0/8"
 
   # Resource defaults (conservative for dev)
   # Note: requests must be <= limits

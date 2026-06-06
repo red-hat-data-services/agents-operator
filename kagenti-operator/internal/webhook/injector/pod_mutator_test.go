@@ -167,16 +167,16 @@ func TestInjectAuthBridge_NoAgentRuntime_InjectsWithDefaults(t *testing.T) {
 		t.Fatal("expected InjectAuthBridge to return true with defaults-only config")
 	}
 
-	// Default mode is proxy-sidecar — expect authbridge-proxy container,
-	// no envoy-proxy / proxy-init / standalone spiffe-helper.
+	// Default mode is proxy-sidecar — expect authbridge-proxy container and the
+	// always-on enforce-redirect proxy-init guard; no envoy-proxy.
 	if !containerExists(podSpec.Containers, AuthBridgeProxyContainerName) {
 		t.Errorf("expected %s container to be injected", AuthBridgeProxyContainerName)
 	}
 	if containerExists(podSpec.Containers, EnvoyProxyContainerName) {
 		t.Errorf("unexpected %s container in proxy-sidecar mode", EnvoyProxyContainerName)
 	}
-	if containerExists(podSpec.InitContainers, ProxyInitContainerName) {
-		t.Errorf("unexpected %s init container in proxy-sidecar mode", ProxyInitContainerName)
+	if !containerExists(podSpec.InitContainers, ProxyInitContainerName) {
+		t.Errorf("expected %s init container in proxy-sidecar mode (always-on enforce-redirect)", ProxyInitContainerName)
 	}
 }
 
@@ -781,6 +781,73 @@ func TestInjectAuthBridge_WaypointMode_SkipsInjection(t *testing.T) {
 	}
 }
 
+// Egress enforcement is always-on for proxy-sidecar: a proxy-init container is
+// always injected in enforce-redirect mode; envoy-sidecar is unaffected (it
+// uses redirect mode, tested elsewhere).
+func TestInjectAuthBridge_ProxySidecar_EgressEnforcement(t *testing.T) {
+	ctx := context.Background()
+	labels := map[string]string{KagentiTypeLabel: KagentiTypeAgent}
+	makePod := func() *corev1.PodSpec {
+		return &corev1.PodSpec{
+			ServiceAccountName: "my-agent",
+			Containers:         []corev1.Container{{Name: "agent", Image: "my-agent:latest"}},
+		}
+	}
+	findProxyInit := func(spec *corev1.PodSpec) *corev1.Container {
+		for i := range spec.InitContainers {
+			if spec.InitContainers[i].Name == ProxyInitContainerName {
+				return &spec.InitContainers[i]
+			}
+		}
+		return nil
+	}
+
+	t.Run("always injects proxy-init in enforce-redirect mode", func(t *testing.T) {
+		m := newTestMutator(newAgentRuntimeWithMode("team1", "my-agent", ModeProxySidecar))
+		spec := makePod()
+		if _, err := m.InjectAuthBridge(ctx, spec, "team1", "my-agent", labels, nil); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		ic := findProxyInit(spec)
+		if ic == nil {
+			t.Fatal("proxy-init should always be injected for proxy-sidecar")
+		}
+		var mode, transparentPort string
+		for _, e := range ic.Env {
+			switch e.Name {
+			case "MODE":
+				mode = e.Value
+			case "TRANSPARENT_PORT":
+				transparentPort = e.Value
+			}
+		}
+		if mode != "enforce-redirect" {
+			t.Errorf("proxy-init MODE = %q, want enforce-redirect", mode)
+		}
+		if transparentPort == "" {
+			t.Error("enforce-redirect must set TRANSPARENT_PORT")
+		}
+	})
+
+	t.Run("does not duplicate an existing proxy-init", func(t *testing.T) {
+		m := newTestMutator(newAgentRuntimeWithMode("team1", "my-agent", ModeProxySidecar))
+		spec := makePod()
+		spec.InitContainers = []corev1.Container{{Name: ProxyInitContainerName, Image: "preexisting"}}
+		if _, err := m.InjectAuthBridge(ctx, spec, "team1", "my-agent", labels, nil); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		count := 0
+		for _, c := range spec.InitContainers {
+			if c.Name == ProxyInitContainerName {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Errorf("expected proxy-init not duplicated, got %d", count)
+		}
+	})
+}
+
 func TestInjectAuthBridge_ProxySidecarMode_InjectsCorrectly(t *testing.T) {
 	m := newTestMutator(newAgentRuntimeWithMode("team1", "my-agent", ModeProxySidecar))
 	ctx := context.Background()
@@ -817,11 +884,15 @@ func TestInjectAuthBridge_ProxySidecarMode_InjectsCorrectly(t *testing.T) {
 		t.Error("authbridge-proxy container not found")
 	}
 
-	// Should NOT have proxy-init (no iptables in proxy-sidecar mode)
+	// Should have the always-on enforce-redirect proxy-init guard.
+	proxyInitFound := false
 	for _, c := range podSpec.InitContainers {
 		if c.Name == ProxyInitContainerName {
-			t.Error("proxy-init should not be injected in proxy-sidecar mode")
+			proxyInitFound = true
 		}
+	}
+	if !proxyInitFound {
+		t.Error("proxy-init (enforce-redirect) should be injected in proxy-sidecar mode")
 	}
 
 	// Should NOT have envoy-proxy container
