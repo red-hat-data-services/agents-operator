@@ -40,13 +40,13 @@ import (
 )
 
 const (
-	// MLflowExperimentsAPIGroup is the API group used by the MLflow Kubernetes
-	// authorization plugin for SubjectAccessReview checks.
-	MLflowExperimentsAPIGroup = "mlflow.opendatahub.io"
+	// MLflowExperimentsAPIGroup is the API group used by the MLflow gateway's
+	// Kubernetes authorization plugin for SubjectAccessReview checks.
+	MLflowExperimentsAPIGroup = "mlflow.kubeflow.org"
 
 	// MLflowExperimentsResource is the virtual resource the MLflow gateway checks
-	// when authorizing experiment-level operations.
-	MLflowExperimentsResource = "mlflowexperiments"
+	// when authorizing experiment-level operations via SubjectAccessReview.
+	MLflowExperimentsResource = "experiments"
 
 	// MLflow annotation keys stored on the PodTemplateSpec.
 	AnnotationMLflowExperimentID   = "mlflow.kagenti.io/experiment-id"
@@ -67,6 +67,12 @@ type MLflowReconciler struct {
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
 
+	// MLflowCAFile is the path to a PEM-encoded CA bundle for verifying the
+	// MLflow gateway TLS certificate. When set, the CA is appended to the
+	// system cert pool. Required on clusters where the MLflow Route uses a
+	// non-publicly-trusted certificate (e.g., HyperShift ingress CA).
+	MLflowCAFile string
+
 	// NewMLflowClient creates an MLflow client for the given base URL.
 	// If nil, a default client is used.
 	NewMLflowClient func(baseURL string) *mlflow.Client
@@ -76,8 +82,8 @@ type MLflowReconciler struct {
 	ResolveTrackingURI func(ctx context.Context) string
 }
 
-// +kubebuilder:rbac:groups=mlflow.opendatahub.io,resources=mlflows,verbs=get;list;watch
-// +kubebuilder:rbac:groups=mlflow.opendatahub.io,resources=mlflowexperiments,verbs=get;list;watch;update
+// +kubebuilder:rbac:groups=mlflow.opendatahub.io,resources=mlflows,verbs=create;get;list;update;watch
+// +kubebuilder:rbac:groups=mlflow.kubeflow.org,resources=experiments,verbs=get;list;watch;update
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;get;list;watch;update
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;get;list;watch;update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
@@ -159,7 +165,7 @@ func (r *MLflowReconciler) mlflowClient(baseURL string) *mlflow.Client {
 	if r.NewMLflowClient != nil {
 		return r.NewMLflowClient(baseURL)
 	}
-	return &mlflow.Client{BaseURL: baseURL}
+	return &mlflow.Client{BaseURL: baseURL, CAFile: r.MLflowCAFile}
 }
 
 // trackingURI returns the MLflow tracking URI, using the override if set.
@@ -223,22 +229,35 @@ func (r *MLflowReconciler) configureDeployment(ctx context.Context, dep *appsv1.
 		if annotations == nil {
 			annotations = make(map[string]string)
 		}
-		annotations[AnnotationMLflowExperimentID] = experimentID
-		annotations[AnnotationMLflowExperimentName] = experimentName
-		annotations[AnnotationMLflowTrackingURI] = trackingURI
-		annotations[AnnotationMLflowTrackingAuth] = "kubernetes-namespaced"
+
+		annotationsChanged := false
+		for k, v := range map[string]string{
+			AnnotationMLflowExperimentID:   experimentID,
+			AnnotationMLflowExperimentName: experimentName,
+			AnnotationMLflowTrackingURI:    trackingURI,
+			AnnotationMLflowTrackingAuth:   "kubernetes-namespaced",
+		} {
+			if annotations[k] != v {
+				annotations[k] = v
+				annotationsChanged = true
+			}
+		}
 		latest.Spec.Template.Annotations = annotations
 
-		changed := false
+		envChanged := false
 		for i := range latest.Spec.Template.Spec.Containers {
 			for name, value := range desired {
 				if setEnvVar(&latest.Spec.Template.Spec.Containers[i], name, value) {
-					changed = true
+					envChanged = true
 				}
 			}
 		}
 
-		if changed {
+		if !envChanged && !annotationsChanged {
+			return nil
+		}
+
+		if envChanged {
 			logger.Info("Injected MLflow env vars into Deployment containers", "deployment", dep.Name)
 		}
 

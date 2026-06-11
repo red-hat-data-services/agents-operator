@@ -81,13 +81,13 @@ kind delete cluster
 | Audit mode | With signature | Unsigned card syncs (Synced=True) but reports SignatureVerified=False with reason SignatureInvalidAudit |
 | Signed agent | With signature | SPIRE-signed card gets SignatureVerified=True, correct SPIFFE ID, Synced=True, and Bound=True |
 | Apply labels and config-hash | Agent lifecycle | AgentRuntime controller adds `kagenti.io/type=agent`, `managed-by`, config-hash, and triggers AgentCard auto-creation |
-| Phase=Active and Ready=True | Agent lifecycle | AgentRuntime CR reaches Active phase with Ready=True condition |
+| Ready=True | Agent lifecycle | AgentRuntime CR reaches Ready=True condition |
 | Idempotent re-reconcile | Agent lifecycle | Deployment generation stays stable over 30s (no spurious updates) |
-| Clean up on deletion | Agent lifecycle | Deletion preserves `kagenti.io/type`, removes `managed-by`, updates config-hash to defaults-only |
-| Missing target error | Error cases | AgentRuntime targeting non-existent Deployment sets Phase=Error |
+| Clean up on deletion | Agent lifecycle | Deletion preserves `kagenti.io/type`, removes `managed-by`, config-hash stays the same (no CR fields in hash) |
+| Missing target error | Error cases | AgentRuntime targeting non-existent Deployment sets TargetResolved=False |
 | Tool type label | Tool type | AgentRuntime with type=tool applies `kagenti.io/type=tool` label and no AgentCard is created |
 | StatefulSet target | StatefulSet target | AgentRuntime applies labels, config-hash, and reaches Active for a StatefulSet workload |
-| Identity/trace overrides | Identity and trace overrides | AgentRuntime with identity+trace spec produces a different config-hash than a minimal CR |
+| Identity/trace overrides | Identity and trace overrides | AgentRuntime with identity+trace spec produces the same config-hash as a minimal CR (CR fields excluded from hash) |
 ## Architecture
 
 ### What gets installed
@@ -177,7 +177,7 @@ kind load docker-image           ▼                   kubectl apply --server-si
 
 The AgentRuntime E2E tests use a separate namespace (`e2e-agentruntime-test`) and lightweight
 `pause:3.9` containers (no HTTP serving needed). The test creates ConfigMap fixtures to exercise
-the 3-layer config merge:
+the 2-layer config merge:
 
 ```
 BeforeAll (AgentRuntime E2E)
@@ -198,10 +198,10 @@ AgentRuntime controller flow:
                                                                  │
 ┌─ AgentRuntime CR ─────────┐     ┌─ Controller ────────────┐    │    ┌─ e2e-agentruntime-test ────────┐
 │  spec.type: agent         │────▶│  Resolve target          │◀───┘    │  runtime-ns-defaults ConfigMap  │
-│  spec.targetRef:          │     │  Resolve config (3-layer)│◀────────│  (namespace defaults, layer 2)  │
+│  spec.targetRef:          │     │  Resolve config (2-layer)│◀────────│  (namespace defaults, layer 2)  │
 │    name: runtime-agent-   │     │  Apply labels + hash     │         │                                  │
-│          target           │     │  Set Phase=Active        │         │  runtime-agent-target Deployment │
-└───────────────────────────┘     └──────────┬───────────────┘         │  runtime-tool-target Deployment  │
+│          target           │     └──────────┬───────────────┘         │  runtime-agent-target Deployment │
+└───────────────────────────┘                │                         │  runtime-tool-target Deployment  │
                                              │                         │  runtime-sts-target StatefulSet  │
                                              │                         │  runtime-minimal-target Deploy.  │
                                              │                         │  runtime-overrides-target Deploy.│
@@ -304,7 +304,7 @@ Test verifies: `SignatureVerified=True` (reason `SignatureValid`),
 
 Deploys `runtime-agent-target` (pause container with `protocol.kagenti.io/a2a` label) and
 creates an AgentRuntime CR with `type: agent` targeting it. The controller resolves the target,
-merges 3-layer config (cluster ConfigMap `kagenti-platform-config` in `kagenti-system` +
+merges 2-layer config (cluster ConfigMap `kagenti-platform-config` in `kagenti-system` +
 namespace ConfigMap with `kagenti.io/defaults=true` + CR-level overrides), and applies labels
 to the Deployment. Test verifies `kagenti.io/type=agent` on both workload metadata and pod
 template, `app.kubernetes.io/managed-by=kagenti-operator` on workload metadata, and
@@ -313,11 +313,11 @@ verifies the cross-controller interaction: once `kagenti.io/type=agent` is appli
 the existing `protocol.kagenti.io/a2a` label, AgentCardSync auto-creates an AgentCard
 (`runtime-agent-target-deployment-card`) with the correct `managed-by` label and targetRef.
 
-#### Phase=Active and Ready=True
+#### Ready=True
 
 Uses the AgentRuntime CR from the previous test (ordered context). Once the controller has
-resolved the target and applied configuration, it sets `status.phase=Active` and the `Ready`
-condition to `True`. Test verifies both fields via jsonpath.
+resolved the target and applied configuration, it sets the `Ready` condition to `True`.
+Test verifies via jsonpath.
 
 #### Idempotent re-reconcile
 
@@ -333,16 +333,15 @@ Deletes the AgentRuntime CR and verifies the finalizer (`kagenti.io/cleanup`) ru
 1. **Target Deployment still exists** — the controller cleans up labels, not the workload
 2. **`kagenti.io/type=agent` preserved** — workload remains classified after runtime removal
 3. **`app.kubernetes.io/managed-by` removed** — workload is no longer operator-managed
-4. **`kagenti.io/config-hash` changes** — updated to a defaults-only hash (cluster + namespace
-   defaults without CR-level overrides), which differs from the initial hash and triggers a
-   rolling update
+4. **`kagenti.io/config-hash` stays the same** — no CR fields in hash, so deletion does not
+   change the hash or trigger a rolling update
 5. **AgentRuntime CR returns 404** — finalizer completed and CR was fully deleted
 
 #### Missing target error
 
 Creates an AgentRuntime CR targeting `nonexistent-deployment`. The controller's target
 resolution fails because no Deployment with that name exists. The controller sets
-`status.phase=Error`. Test verifies the Error phase via jsonpath, then cleans up the CR.
+`TargetResolved=False`. Test verifies via jsonpath, then cleans up the CR.
 
 #### Tool type label
 
@@ -365,9 +364,8 @@ StatefulSet metadata, Phase=Active, and a valid 64-char config-hash on the pod t
 Deploys two target Deployments and creates two AgentRuntime CRs: one minimal (no overrides)
 and one with `spec.identity.spiffe.trustDomain` and `spec.trace` (endpoint, protocol, sampling
 rate). Both CRs reach Phase=Active. The test records each Deployment's `kagenti.io/config-hash`
-annotation and asserts they differ, proving that identity and trace overrides are included in
-the config hash computation. This validates the full CRD → controller → config merge path for
-optional spec fields.
+annotation and asserts they are the same, confirming that CR-level overrides are excluded from
+the config hash (2-layer merge). The webhook reads CR overrides at pod CREATE time instead.
 
 ## Troubleshooting
 

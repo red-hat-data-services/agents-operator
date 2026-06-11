@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,8 +76,9 @@ func init() {
 }
 
 // getOperatorNamespace returns the namespace the operator is running in.
-// Reads from POD_NAMESPACE environment variable (set via downward API in deployment),
-// falling back to kagenti-system if not set.
+// In production, the manager_webhook_patch.yaml injects POD_NAMESPACE via
+// the downward API, so the fallback is effectively dead code. It exists for
+// local development and test runs where the webhook patch is not applied.
 func getOperatorNamespace() string {
 	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
 		return ns
@@ -105,6 +107,9 @@ func main() {
 	var enforceNetworkPolicies bool
 	var enableMLflow bool
 	var enableOtelBootstrap bool
+	var mlflowWorkspace string
+	var mlflowExperimentName string
+	var mlflowCAFile string
 
 	var enableCardDiscovery bool
 
@@ -158,6 +163,12 @@ func main() {
 		"Enable MLflow experiment tracking integration")
 	flag.BoolVar(&enableOtelBootstrap, "enable-otel-bootstrap", false,
 		"Enable OTel collector bootstrap (ingress CA trust and ConfigMap assembly) at startup")
+	flag.StringVar(&mlflowWorkspace, "mlflow-workspace", "",
+		"Kubernetes namespace used as the x-mlflow-workspace header value (RHOAI only)")
+	flag.StringVar(&mlflowExperimentName, "mlflow-experiment-name", "kagenti-traces",
+		"MLflow experiment name; created automatically if it doesn't exist")
+	flag.StringVar(&mlflowCAFile, "mlflow-ca-file", "",
+		"Path to PEM-encoded CA bundle for MLflow TLS verification (appended to system pool)")
 
 	flag.BoolVar(&enableCardDiscovery, "enable-card-discovery", false,
 		"Enable automatic agent card discovery from AgentRuntime workloads into status.card")
@@ -301,6 +312,11 @@ func main() {
 			config.GetCertificate = metricsCertWatcher.GetCertificate
 		})
 	}
+
+	// ========================================
+	// Operator namespace resolution
+	// ========================================
+	controller.SetClusterDefaultsNamespace(getOperatorNamespace())
 
 	cmCacheNamespaces := buildConfigMapCacheNamespaces(
 		requireA2ASignature, spireTrustBundleConfigMapName, spireTrustBundleConfigMapNS,
@@ -482,6 +498,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	if controller.NetworkOperatorCRDExists(mgr.GetConfig()) {
+		if warning := controller.CheckOVNNetworkConfig(context.Background(), mgr.GetAPIReader()); warning != "" {
+			setupLog.Error(fmt.Errorf("OVN network misconfiguration"), warning)
+		} else {
+			setupLog.Info("OVN-Kubernetes routingViaHost is correctly configured")
+		}
+	}
+
 	artReconciler := &controller.AgentRuntimeReconciler{
 		Client:              mgr.GetClient(),
 		APIReader:           mgr.GetAPIReader(),
@@ -506,9 +530,10 @@ func main() {
 
 	if enableMLflow {
 		if err = (&controller.MLflowReconciler{
-			Client:   mgr.GetClient(),
-			Scheme:   mgr.GetScheme(),
-			Recorder: mgr.GetEventRecorderFor("mlflow-controller"),
+			Client:       mgr.GetClient(),
+			Scheme:       mgr.GetScheme(),
+			Recorder:     mgr.GetEventRecorderFor("mlflow-controller"), //nolint:staticcheck
+			MLflowCAFile: mlflowCAFile,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "MLflow")
 			os.Exit(1)
@@ -526,6 +551,18 @@ func main() {
 			os.Exit(1)
 		}
 		setupLog.Info("MLflow UI config bootstrap enabled")
+
+		if err = (&controller.MLflowOperandReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+			//nolint:staticcheck // consistent with existing controllers
+			Recorder:          mgr.GetEventRecorderFor("mlflow-operand-controller"),
+			OperatorNamespace: getOperatorNamespace(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "MLflowOperand")
+			os.Exit(1)
+		}
+		setupLog.Info("MLflow operand controller enabled")
 	}
 
 	if enableClientRegistration {
@@ -560,6 +597,7 @@ func main() {
 	if controller.CertManagerCRDExists(mgr.GetConfig()) {
 		if err = (&controller.SharedTrustReconciler{
 			Client:   mgr.GetClient(),
+			Scheme:   mgr.GetScheme(),
 			Recorder: mgr.GetEventRecorderFor("shared-trust-controller"), //nolint:staticcheck
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "SharedTrust")
@@ -603,11 +641,14 @@ func main() {
 
 	if enableOtelBootstrap {
 		otelBootstrap := &bootstrap.OtelBootstrapRunnable{
-			Client:    mgr.GetClient(),
-			APIReader: mgr.GetAPIReader(),
-			Config:    mgr.GetConfig(),
-			Namespace: getOperatorNamespace(),
-			Log:       ctrl.Log.WithName("bootstrap"),
+			Client:               mgr.GetClient(),
+			APIReader:            mgr.GetAPIReader(),
+			Config:               mgr.GetConfig(),
+			Scheme:               mgr.GetScheme(),
+			Namespace:            getOperatorNamespace(),
+			Log:                  ctrl.Log.WithName("bootstrap"),
+			MLflowWorkspace:      mlflowWorkspace,
+			MLflowExperimentName: mlflowExperimentName,
 		}
 		if err := mgr.Add(otelBootstrap); err != nil {
 			setupLog.Error(err, "unable to add OTel bootstrap runnable")
@@ -657,6 +698,10 @@ func main() {
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
+		os.Exit(1)
+	}
+	if err := mgr.AddReadyzCheck("webhook", webhookServer.StartedChecker()); err != nil {
+		setupLog.Error(err, "unable to set up webhook ready check")
 		os.Exit(1)
 	}
 

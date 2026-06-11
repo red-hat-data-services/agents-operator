@@ -398,11 +398,12 @@ Both resources use the shared `TargetRef` type to reference the backing workload
 
 ### Configuration Precedence
 
-The controller merges configuration from three layers (highest priority wins):
+The controller computes the config hash from two platform layers (highest priority wins):
 
-1. **AgentRuntime CR spec** — per-workload overrides (trust domain, etc.)
-2. **Namespace defaults** — ConfigMap with `kagenti.io/defaults=true` label in the workload's namespace
-3. **Cluster defaults** — `kagenti-platform-config` ConfigMap in `kagenti-system`
+1. **Namespace defaults** — ConfigMap with `kagenti.io/defaults=true` label in the workload's namespace
+2. **Cluster defaults** — `kagenti-platform-config` ConfigMap in `kagenti-system`
+
+> **Note:** Per-CR overrides (identity, authBridgeMode, mtlsMode) are **not** included in the controller's config hash. The webhook reads these fields at pod CREATE time.
 
 > **Note:** Feature gates (`kagenti-feature-gates`) are platform-wide policy and are **not** overrideable by namespace defaults or AgentRuntime CRs. They control which AuthBridge components (envoy proxy, SPIFFE helper, client registration) are enabled globally, and whether skill discovery (`skillDiscovery`) is active.
 
@@ -461,7 +462,7 @@ The AgentRuntime controller applies the following labels and annotations to the 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `phase` | string | High-level state of the AgentRuntime (`Pending`, `Active`, or `Error`) |
+| `observedGeneration` | int64 | Most recent generation observed by the controller |
 | `configuredPods` | int32 | Count of pods with expected labels/configuration |
 | `conditions` | [][Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#condition-v1-meta) | Current state of the AgentRuntime |
 
@@ -479,7 +480,6 @@ The AgentRuntime controller applies the following labels and annotations to the 
 | `IstioMeshEnrolled` | True | `NamespaceLabeled` | Namespace labeled with `istio-discovery=enabled` and `istio.io/dataplane-mode=ambient` for Istio ambient mesh enrollment |
 | `IstioMeshEnrolled` | False | `OptedOut` | Namespace has `kagenti.io/istio-mesh=disabled` annotation; Istio mesh labels not applied |
 | `IstioMeshEnrolled` | False | `PatchFailed` | Failed to patch namespace labels (e.g., RBAC misconfiguration). Non-fatal; reconcile continues. |
-| `SkillsDiscovered` | True | `SkillsFound` | Linked skills discovered from `kagenti.io/skills` annotation on the target workload |
 | `SkillsMounted` | True | `SkillsApplied` | OCI skill ImageVolumes applied to the target workload |
 | `SkillsMounted` | False | `FeatureGateDisabled` | Skills defined but `skillImageVolumes` feature gate is disabled |
 | `SkillsMounted` | False | `UnsupportedWorkloadKind` | Skills defined but the target workload kind (e.g., Sandbox) does not support skill ImageVolumes |
@@ -585,15 +585,12 @@ kubectl get art
 kubectl get agentruntimes
 
 # Example output:
-# NAME                      TYPE    TARGET          PHASE    AGE
-# weather-agent-runtime     agent   weather-agent   Active   5m
-# calculator-tool-runtime   tool    calculator-tool Active   3m
+# NAME                      TYPE    TARGET          READY   AGE
+# weather-agent-runtime     agent   weather-agent   True    5m
+# calculator-tool-runtime   tool    calculator-tool True    3m
 
 # Get detailed information
 kubectl describe agentruntime weather-agent-runtime
-
-# View runtime phase
-kubectl get art weather-agent-runtime -o jsonpath='{.status.phase}'
 
 # View configured pods count
 kubectl get art weather-agent-runtime -o jsonpath='{.status.configuredPods}'
