@@ -1,6 +1,6 @@
 # AuthBridge proxy-sidecar combined image — Konflux downstream build.
 # Build context: authbridge/ (needs access to authlib/ and cmd/authbridge-proxy/)
-FROM registry.redhat.io/ubi9/go-toolset@sha256:5d26ff5606bd6590930e7cfc202b510e3fe2c7a7a1720860f444ab49c45128cb AS builder
+FROM registry.redhat.io/ubi9/go-toolset@sha256:0b471eb04868f3d9d90bf3c668f9c6c7a22cef07474ac9fec067909dfd7dec7c AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -32,7 +32,7 @@ RUN CGO_ENABLED=1 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -a -o /authbridge-proxy .
 
 # Use UBI minimal as the runtime base image
-FROM registry.redhat.io/ubi9/ubi-minimal@sha256:dd334afa72444fa46238fcf9e6bd399245adf746378735348cf84b9dfdca38f1
+FROM registry.redhat.io/ubi9/ubi-minimal@sha256:57c8151c51445a07e503dab9dc9211dc3cdeac9d45ed81a10954b7d770659b3b
 
 WORKDIR /
 COPY --from=builder --chmod=755 /authbridge-proxy /usr/local/bin/authbridge-proxy
