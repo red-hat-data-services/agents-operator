@@ -32,7 +32,7 @@ RUN CGO_ENABLED=1 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -a -o /authbridge-proxy .
 
 # Use UBI minimal as the runtime base image
-FROM registry.redhat.io/ubi9/ubi-minimal@sha256:8eb2830d0936237fc13a1f2f7e45aecf90d69043380ad167fad0343632937f41
+FROM registry.redhat.io/ubi9/ubi-minimal@sha256:580752f96d36c4132bffd30f9c34865bf4bd87f6aa161c969d117f21732e50f7
 
 WORKDIR /
 COPY --from=builder --chmod=755 /authbridge-proxy /usr/local/bin/authbridge-proxy
